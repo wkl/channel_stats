@@ -19,33 +19,46 @@
 #ifndef _DBG_MACROS_H
 #define _DBG_MACROS_H
 
-#include <ts/ts.h>
-#include <inttypes.h>
-#define __STDC_FORMAT_MACROS
+// #include <ts/ts.h>
 
 #define TAG PLUGIN_NAME
+#define API_TAG PLUGIN_NAME ".api"
 
-#define debug(fmt, args...) do {                                    \
-  TSDebug(TAG, "DEBUG: [%s:%d] [%s] " fmt, __FILE__, __LINE__, __FUNCTION__ , ##args ); \
-  } while (0)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#define likely(x)   __builtin_expect(!!(x), 1)
 
-#define info(fmt, args...) do {                                    \
-  TSDebug(TAG, "INFO: " fmt, ##args ); \
-  } while (0)
+#define debug_tag(tag, fmt, ...) do { \
+    if (unlikely(TSIsDebugTagSet(tag))) { \
+        TSDebug(tag, fmt, ##__VA_ARGS__); \
+    } \
+} while(0)
 
-#define warning(fmt, args...) do {                                    \
-  TSDebug(TAG, "WARNING: " fmt, ##args ); \
+#define debug(fmt, ...) \
+  debug_tag(TAG, "DEBUG: [%s:%d] [%s] " fmt, __FILE__, __LINE__, __FUNCTION__ , ##__VA_ARGS__);
+
+#define info(fmt, ...) \
+  debug_tag(TAG, "INFO: " fmt, ##__VA_ARGS__);
+
+#define warning(fmt, ...) \
+  debug_tag(TAG, "WARNING: " fmt, ##__VA_ARGS__);
+
+#define error(fmt, ...) do { \
+  TSError("[%s:%d] [%s] ERROR: " fmt, __FILE__, __LINE__, __FUNCTION__ , ##__VA_ARGS__); \
+  debug_tag(TAG, "[%s:%d] [%s] ERROR: " fmt, __FILE__, __LINE__, __FUNCTION__ , ##__VA_ARGS__); \
 } while (0)
 
-#define error(fmt, args...) do {                                    \
-  TSError("[%s:%d] [%s] ERROR: " fmt, __FILE__, __LINE__, __FUNCTION__ , ##args ); \
-  TSDebug(TAG, "[%s:%d] [%s] ERROR: " fmt, __FILE__, __LINE__, __FUNCTION__ , ##args ); \
-} while (0)
-
-#define fatal(fmt, args...) do {                                    \
-  TSError("[%s:%d] [%s] ERROR: " fmt, __FILE__, __LINE__, __FUNCTION__ , ##args ); \
-  TSDebug(TAG, "[%s:%d] [%s] ERROR: " fmt, __FILE__, __LINE__, __FUNCTION__ , ##args ); \
+#define fatal(fmt, ...) do { \
+  TSError("[%s:%d] [%s] ERROR: " fmt, __FILE__, __LINE__, __FUNCTION__ , ##__VA_ARGS__); \
+  debug_tag(TAG, "[%s:%d] [%s] ERROR: " fmt, __FILE__, __LINE__, __FUNCTION__ , ##__VA_ARGS__); \
   exit(-1); \
+} while (0)
+
+#define debug_api(fmt, ...) \
+  debug_tag(API_TAG, "DEBUG: [%s:%d] [%s] " fmt, __FILE__, __LINE__, __FUNCTION__ , ##__VA_ARGS__);
+
+#define error_api(fmt, ...) do { \
+  TSError("[%s:%d] [%s] ERROR: " fmt, __FILE__, __LINE__, __FUNCTION__ , ##__VA_ARGS__); \
+  debug_tag(API_TAG, "ERROR: [%s:%d] [%s] " fmt, __FILE__, __LINE__, __FUNCTION__ , ##__VA_ARGS__); \
 } while (0)
 
 #define HRTIME_FOREVER  (10*HRTIME_DECADE)
