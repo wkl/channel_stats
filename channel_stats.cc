@@ -9,13 +9,13 @@
   Created by Conan Wang <buaawkl@gmail.com> on 2012-11-05.
 */
 
-#include <string.h>
-#include <stdio.h>
-#include <ctype.h>
-#include <inttypes.h>
+#include <cstdio>
+#include <cstring>
 #include <string>
+#include <inttypes.h>
 // #include <ext/hash_map>
 #include <map>
+#include <sstream>
 #define __STDC_FORMAT_MACROS
 
 #include <ts/ts.h>
@@ -42,24 +42,24 @@ struct channel_stat {
   channel_stat()
       : response_bytes_content(0), 
         response_count_2xx(0),
-        speed_bytes_per_sec_50k(0) {
+        speed_ua_bytes_per_sec_50k(0) {
   }
 
   inline void increment(uint64_t rbc, uint64_t rc2, uint64_t sbps5) {
     __sync_fetch_and_add(&response_bytes_content, rbc);
-    if (rc2 == 1) __sync_fetch_and_add(&response_count_2xx, rc2);
-    if (sbps5 == 1) __sync_fetch_and_add(&speed_bytes_per_sec_50k, sbps5);
+    if (rc2) __sync_fetch_and_add(&response_count_2xx, rc2);
+    if (sbps5) __sync_fetch_and_add(&speed_ua_bytes_per_sec_50k, sbps5);
   }
 
   void debug_channel() {
     debug("response.bytes.content: %" PRIu64 "", response_bytes_content);
     debug("response.count.2xx: %" PRIu64 "", response_count_2xx);
-    debug("speed.bytes_per_sec_50k: %" PRIu64 "", speed_bytes_per_sec_50k);
+    debug("speed.ua.bytes_per_sec_50k: %" PRIu64 "", speed_ua_bytes_per_sec_50k);
   }
 
   uint64_t response_bytes_content;
   uint64_t response_count_2xx;
-  uint64_t speed_bytes_per_sec_50k;
+  uint64_t speed_ua_bytes_per_sec_50k;
 };
 
 // using namespace __gnu_cxx;
@@ -69,9 +69,26 @@ typedef stats_map_type::const_iterator const_iterator;
 typedef stats_map_type::iterator iterator;
 
 static stats_map_type channel_stats;
+static TSMutex stats_map_mutex;
 
-static int handle_hook(TSCont contp, TSEvent event, void *edata);
-static int api_origin(TSCont contp, TSEvent event, void *edata);
+// api Intercept Data
+
+typedef struct intercept_state_t
+{
+  TSVConn net_vc;
+  TSVIO read_vio;
+  TSVIO write_vio;
+
+  TSIOBuffer req_buffer;
+  TSIOBuffer resp_buffer;
+  TSIOBufferReader resp_reader;
+
+  int output_bytes;
+  int body_written;
+} intercept_state;
+
+static int handle_event(TSCont contp, TSEvent event, void *edata);
+static int api_handle_event(TSCont contp, TSEvent event, void *edata);
 
 static void
 destroy_cdata(cdata * cd)
@@ -86,22 +103,49 @@ static void
 handle_read_req(TSCont contp, TSHttpTxn txnp)
 {
   TSMBuffer bufp;
-  TSMLoc hdr_loc;
+  TSMLoc hdr_loc = NULL;
+  TSMLoc url_loc = NULL;
+  TSMLoc host_field_loc = NULL;
+  const char* host_field;
+  int host_field_length = 0;
+  TSCont txn_contp;
+
+  const char * path;
+  int path_len;
   cdata * cd;
+  TSCont api_contp;
+  intercept_state *api_state;
 
   if (TSHttpTxnClientReqGet(txnp, &bufp, &hdr_loc) != TS_SUCCESS) {
     error("couldn't retrieve client's request");
-    return;
+    goto cleanup;
   }
 
-  // int length;
-  // char *url = TSHttpTxnEffectiveUrlStringGet(txnp, &length);
-  // debug("%*s", length, url);
-  // TSfree(url);
+  if (TSHttpHdrUrlGet(bufp, hdr_loc, &url_loc) != TS_SUCCESS)
+    goto cleanup;
 
-  TSMLoc host_field_loc;
-  const char* host_field;
-  int host_field_length = 0;
+  path = TSUrlPathGet(bufp, url_loc, &path_len);
+
+  if (path_len == 0 || (unsigned)path_len != api_path.length() ||
+        strncmp(api_path.c_str(), path, path_len) != 0) {
+    goto not_api;
+  }
+  
+  TSSkipRemappingSet(txnp, 1); //not strictly necessary, but speed is everything these days
+
+  /* register our intercept */
+  debug_api("Intercepting request");
+
+  api_contp = TSContCreate(api_handle_event, TSMutexCreate());
+  api_state = (intercept_state *) TSmalloc(sizeof(*api_state));
+  memset(api_state, 0, sizeof(*api_state));
+  TSContDataSet(api_contp, api_state);
+  TSHttpTxnIntercept(api_contp, txnp);
+
+  goto cleanup;
+
+not_api:
+
   host_field_loc = TSMimeHdrFieldFind(bufp, hdr_loc, 
                                       TS_MIME_FIELD_HOST, TS_MIME_LEN_HOST);
   if (host_field_loc) {
@@ -109,20 +153,21 @@ handle_read_req(TSCont contp, TSHttpTxn txnp)
                                               0, &host_field_length);
   } else {
     warning("no valid host header");
-    TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
-    return;
+    goto cleanup;
   }
   debug("origin host: %.*s", host_field_length, host_field);
 
-  TSCont txn_contp = TSContCreate(handle_hook, NULL); // we reuse global hander
+  txn_contp = TSContCreate(handle_event, NULL); // reuse global hander
   cd = (cdata *) TSmalloc(sizeof(cdata));
   cd->host = TSstrndup(host_field, host_field_length);
   TSContDataSet(txn_contp, cd);
 
   TSHttpTxnHookAdd(txnp, TS_HTTP_TXN_CLOSE_HOOK, txn_contp);
 
-  TSHandleMLocRelease(bufp, hdr_loc, host_field_loc);
-  TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
+cleanup:
+  if (host_field_loc) TSHandleMLocRelease(bufp, hdr_loc, host_field_loc);
+  if (url_loc) TSHandleMLocRelease(bufp, hdr_loc, url_loc);
+  if (hdr_loc) TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
 }
 
 static void
@@ -130,8 +175,6 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
 {
   TSMBuffer bufp;
   TSMLoc hdr_loc;
-  cdata * cd = (cdata *) TSContDataGet(contp);
-  std::string host = std::string(cd->host);
   uint64_t user_speed;
   uint64_t body_bytes;
   TSHRTime start_time = 0;
@@ -139,9 +182,14 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
   TSHRTime interval_time = 0;
   iterator stat_it;
   channel_stat *stat;
+  std::pair<iterator,bool> insert_ret;
+  cdata * cd = (cdata *) TSContDataGet(contp);
+  std::string host = std::string(cd->host);
+  // tbr
+  std::stringstream ss;
 
   if (TSHttpTxnClientRespGet(txnp, &bufp, &hdr_loc) != TS_SUCCESS) {
-    error("couldn't retrieve final response");
+    warning("couldn't retrieve final response");
     return;
   }
 
@@ -160,39 +208,51 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
     error("not valid time, start: %"PRId64", end: %"PRId64"", start_time, end_time);
     goto cleanup;
   }
-  // TODO body_bytes may = 0, set it inf?
+
   user_speed = (interval_time == 0) ? body_bytes : (int)((float)body_bytes / interval_time * TS_HRTIME_SECOND);
+  if (!user_speed) // body_bytes may = 0
+    user_speed = 100000000;
 
   __sync_fetch_and_add(&global_response_count_2xx_get, 1);
 
   debug("origin host in ContData: %s", host.c_str());
   debug("body bytes: %" PRIu64 "", body_bytes);
-  debug("start time: %" PRId64 "", start_time);
-  debug("end time: %" PRId64 "", end_time);
-  debug("interval time: %" PRId64 "", interval_time);
+  // debug("start time: %" PRId64 "", start_time);
+  // debug("end time: %" PRId64 "", end_time);
+  // debug("interval time: %" PRId64 "", interval_time);
   debug("interval seconds: %.5f", interval_time / (float)TS_HRTIME_SECOND);
   debug("speed bytes per second: %" PRIu64 "", user_speed);
   debug("2xx req count: %" PRIu64 "", global_response_count_2xx_get);
 
+  // ss << (rand() % 1000);
+  // host = host + "--" + ss.str();
+  debug("%s", host.c_str());
   stat_it = channel_stats.find(host);
   if (stat_it == channel_stats.end()) {
     stat = new channel_stat();
-    channel_stats.insert(std::make_pair(host, stat));
-    // check if insert success, may insert concurrently, if not, delete stat
-    debug("*********** new channel ***********")
-    stat->increment(body_bytes, 1, user_speed < 500000 ? 1 : 0);
-    stat->debug_channel();
-  } else {
-    stat_it->second->increment(body_bytes, 1, user_speed < 500000 ? 1 : 0);
-    stat_it->second->debug_channel();
+    TSMutexLock(stats_map_mutex);
+    insert_ret = channel_stats.insert(std::make_pair(host, stat));
+    TSMutexUnlock(stats_map_mutex);
+    if (insert_ret.second == false) {
+      warning("stat of this channel already existed");
+      delete stat;
+      stat = insert_ret.first->second;
+    } else {
+      debug("*********** new channel ***********");
+    }
+  } else { // found
+    stat = stat_it->second;
   }
+
+  stat->increment(body_bytes, 1, user_speed < 50000 ? 1 : 0);
+  stat->debug_channel();
 
 cleanup:
   TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
 }
 
 static int
-handle_hook(TSCont contp, TSEvent event, void *edata) {
+handle_event(TSCont contp, TSEvent event, void *edata) {
   TSHttpTxn txnp = (TSHttpTxn) edata;
 
   switch (event) {
@@ -207,8 +267,6 @@ handle_hook(TSCont contp, TSEvent event, void *edata) {
       break;
     default:
       error("unknown event for this plugin");
-      // TSHttpTxnReenable(txnp, TS_EVENT_HTTP_CONTINUE);
-      // return 0;
   }
 
   TSHttpTxnReenable(txnp, TS_EVENT_HTTP_CONTINUE);
@@ -219,53 +277,39 @@ handle_hook(TSCont contp, TSEvent event, void *edata) {
 
 // below is api part
 
-typedef struct stats_state_t
-{
-  TSVConn net_vc;
-  TSVIO read_vio;
-  TSVIO write_vio;
-
-  TSIOBuffer req_buffer;
-  TSIOBuffer resp_buffer;
-  TSIOBufferReader resp_reader;
-
-  int output_bytes;
-  int body_written;
-} stats_state;
-
 static void
-stats_cleanup(TSCont contp, stats_state * my_state)
+stats_cleanup(TSCont contp, intercept_state * api_state)
 {
-  if (my_state->req_buffer) {
-    TSIOBufferDestroy(my_state->req_buffer);
-    my_state->req_buffer = NULL;
+  if (api_state->req_buffer) {
+    TSIOBufferDestroy(api_state->req_buffer);
+    api_state->req_buffer = NULL;
   }
 
-  if (my_state->resp_buffer) {
-    TSIOBufferDestroy(my_state->resp_buffer);
-    my_state->resp_buffer = NULL;
+  if (api_state->resp_buffer) {
+    TSIOBufferDestroy(api_state->resp_buffer);
+    api_state->resp_buffer = NULL;
   }
-  TSVConnClose(my_state->net_vc);
-  TSfree(my_state);
+  TSVConnClose(api_state->net_vc);
+  TSfree(api_state);
   TSContDestroy(contp);
 }
 
 static void
-stats_process_accept(TSCont contp, stats_state * my_state)
+stats_process_accept(TSCont contp, intercept_state * api_state)
 {
 
-  my_state->req_buffer = TSIOBufferCreate();
-  my_state->resp_buffer = TSIOBufferCreate();
-  my_state->resp_reader = TSIOBufferReaderAlloc(my_state->resp_buffer);
-  my_state->read_vio = TSVConnRead(my_state->net_vc, contp, my_state->req_buffer, INT64_MAX);
+  api_state->req_buffer = TSIOBufferCreate();
+  api_state->resp_buffer = TSIOBufferCreate();
+  api_state->resp_reader = TSIOBufferReaderAlloc(api_state->resp_buffer);
+  api_state->read_vio = TSVConnRead(api_state->net_vc, contp, api_state->req_buffer, INT64_MAX);
 }
 
 static int
-stats_add_data_to_resp_buffer(const char *s, stats_state * my_state)
+stats_add_data_to_resp_buffer(const char *s, intercept_state * api_state)
 {
   int s_len = strlen(s);
 
-  TSIOBufferWrite(my_state->resp_buffer, s, s_len);
+  TSIOBufferWrite(api_state->resp_buffer, s, s_len);
 
   return s_len;
 }
@@ -274,19 +318,19 @@ static const char RESP_HEADER[] =
   "HTTP/1.0 200 Ok\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n\r\n";
 
 static int
-stats_add_resp_header(stats_state * my_state)
+stats_add_resp_header(intercept_state * api_state)
 {
-  return stats_add_data_to_resp_buffer(RESP_HEADER, my_state);
+  return stats_add_data_to_resp_buffer(RESP_HEADER, api_state);
 }
 
 static void
-stats_process_read(TSCont contp, TSEvent event, stats_state * my_state)
+stats_process_read(TSCont contp, TSEvent event, intercept_state * api_state)
 {
   debug_api("stats_process_read(%d)", event);
   if (event == TS_EVENT_VCONN_READ_READY) {
-    my_state->output_bytes = stats_add_resp_header(my_state);
-    TSVConnShutdown(my_state->net_vc, 1, 0);
-    my_state->write_vio = TSVConnWrite(my_state->net_vc, contp, my_state->resp_reader, INT64_MAX);
+    api_state->output_bytes = stats_add_resp_header(api_state);
+    TSVConnShutdown(api_state->net_vc, 1, 0);
+    api_state->write_vio = TSVConnWrite(api_state->net_vc, contp, api_state->resp_reader, INT64_MAX);
   } else if (event == TS_EVENT_ERROR) {
     error_api("stats_process_read: Received TS_EVENT_ERROR\n");
   } else if (event == TS_EVENT_VCONN_EOS) {
@@ -300,19 +344,28 @@ stats_process_read(TSCont contp, TSEvent event, stats_state * my_state)
   }
 }
 
-#define APPEND(a) my_state->output_bytes += stats_add_data_to_resp_buffer(a, my_state)
+#define APPEND(a) api_state->output_bytes += stats_add_data_to_resp_buffer(a, api_state)
 #define APPEND_STAT(a, fmt, v) do { \
   char b[256]; \
   if(snprintf(b, sizeof(b), "\"%s\": \"" fmt "\",\n", a, v) < (signed)sizeof(b)) \
     APPEND(b); \
 } while(0)
-
+#define APPEND_END_STAT(a, fmt, v) do { \
+  char b[256]; \
+  if(snprintf(b, sizeof(b), "\"%s\": \"" fmt "\"\n", a, v) < (signed)sizeof(b)) \
+    APPEND(b); \
+} while(0)
+#define APPEND_DICT_NAME(a) do { \
+  char b[256]; \
+  if(snprintf(b, sizeof(b), "\"%s\": {\n", a) < (signed)sizeof(b)) \
+    APPEND(b); \
+} while(0)
 
 static void
 json_out_stat(TSRecordType rec_type, void *edata, int registered,
               const char *name, TSRecordDataType data_type,
               TSRecordData *datum) {
-  stats_state *my_state = (stats_state *) edata;
+  intercept_state *api_state = (intercept_state *) edata;
 
   switch(data_type) {
   case TS_RECORDDATATYPE_COUNTER:
@@ -329,14 +382,36 @@ json_out_stat(TSRecordType rec_type, void *edata, int registered,
   }
 }
 
+static void
+json_out_channel_stats(intercept_state * api_state) {
+  // XXX may need lock for large numbers of (dynamic) channel
+  if (channel_stats.empty())
+    return;
+
+  iterator last_it = channel_stats.end();
+  last_it--;
+  for (iterator it=channel_stats.begin(); it != channel_stats.end(); it++) {
+    debug("appending: '%s' stats", it->first.c_str());
+    APPEND_DICT_NAME(it->first.c_str());
+    APPEND_STAT("response.bytes.content", "%" PRIu64, it->second->response_bytes_content);
+    APPEND_STAT("response.count.2xx.get", "%" PRIu64, it->second->response_count_2xx);
+    APPEND_END_STAT("speed.ua.bytes_per_sec_50k", "%" PRIu64, it->second->speed_ua_bytes_per_sec_50k);
+    if (it == last_it)
+      APPEND("}\n");
+    else
+      APPEND("},\n");
+  }
+}
 
 static void
-json_out_stats(stats_state * my_state)
+json_out_stats(intercept_state * api_state)
 {
   const char *version;
-  APPEND("{ \"global\": {\n");
-
-  TSRecordDump(TS_RECORDTYPE_PROCESS, json_out_stat, my_state);
+  APPEND("{ \"channel\": {\n");
+  json_out_channel_stats(api_state);
+  APPEND("  },\n");
+  APPEND(" \"global\": {\n");
+  TSRecordDump(TS_RECORDTYPE_PROCESS, json_out_stat, api_state);
   version = TSTrafficServerVersionGet();
   APPEND_STAT("response.count.2xx.get", "%" PRIu64, global_response_count_2xx_get);
   APPEND("\"server\": \"");
@@ -346,18 +421,18 @@ json_out_stats(stats_state * my_state)
 }
 
 static void
-stats_process_write(TSCont contp, TSEvent event, stats_state * my_state)
+stats_process_write(TSCont contp, TSEvent event, intercept_state * api_state)
 {
   if (event == TS_EVENT_VCONN_WRITE_READY) {
-    if (my_state->body_written == 0) {
+    if (api_state->body_written == 0) {
       debug_api("plugin adding response body");
-      my_state->body_written = 1;
-      json_out_stats(my_state);
-      TSVIONBytesSet(my_state->write_vio, my_state->output_bytes);
+      api_state->body_written = 1;
+      json_out_stats(api_state);
+      TSVIONBytesSet(api_state->write_vio, api_state->output_bytes);
     }
-    TSVIOReenable(my_state->write_vio);
+    TSVIOReenable(api_state->write_vio);
   } else if (TS_EVENT_VCONN_WRITE_COMPLETE) {
-    stats_cleanup(contp, my_state);
+    stats_cleanup(contp, api_state);
   } else if (event == TS_EVENT_ERROR) {
     error_api("stats_process_write: Received TS_EVENT_ERROR\n");
   } else {
@@ -367,70 +442,20 @@ stats_process_write(TSCont contp, TSEvent event, stats_state * my_state)
 }
 
 static int
-stats_dostuff(TSCont contp, TSEvent event, void *edata)
+api_handle_event(TSCont contp, TSEvent event, void *edata)
 {
-  stats_state *my_state = (stats_state *) TSContDataGet(contp);
+  intercept_state *api_state = (intercept_state *) TSContDataGet(contp);
   if (event == TS_EVENT_NET_ACCEPT) {
-    my_state->net_vc = (TSVConn) edata;
-    stats_process_accept(contp, my_state);
-  } else if (edata == my_state->read_vio) {
-    stats_process_read(contp, event, my_state);
-  } else if (edata == my_state->write_vio) {
-    stats_process_write(contp, event, my_state);
+    api_state->net_vc = (TSVConn) edata;
+    stats_process_accept(contp, api_state);
+  } else if (edata == api_state->read_vio) {
+    stats_process_read(contp, event, api_state);
+  } else if (edata == api_state->write_vio) {
+    stats_process_write(contp, event, api_state);
   } else {
     error_api("Unexpected Event %d\n", event);
     // TSReleaseAssert(!"Unexpected Event");
   }
-  return 0;
-}
-
-// put together with 'handle_hook'
-static int
-api_origin(TSCont contp, TSEvent event, void *edata)
-{
-  TSCont icontp;
-  stats_state *my_state;
-  TSHttpTxn txnp = (TSHttpTxn) edata;
-  TSMBuffer reqp;
-  TSMLoc hdr_loc = NULL, url_loc = NULL;
-  TSEvent reenable = TS_EVENT_HTTP_CONTINUE;
-  const char* path;
-  int path_len = 0;
-
-  debug_api("in the read stuff");
- 
-  if (TSHttpTxnClientReqGet(txnp, &reqp, &hdr_loc) != TS_SUCCESS)
-    goto cleanup;
-  
-  if (TSHttpHdrUrlGet(reqp, hdr_loc, &url_loc) != TS_SUCCESS)
-    goto cleanup;
-  
-  path = TSUrlPathGet(reqp, url_loc, &path_len);
-
-  if (path_len == 0 || (unsigned)path_len != api_path.length() ||
-        strncmp(api_path.c_str(), path, path_len) != 0) {
-    goto notforme;
-  }
-  
-  TSSkipRemappingSet(txnp,1); //not strictly necessary, but speed is everything these days
-
-  /* This is us -- register our intercept */
-  debug_api("Intercepting request");
-
-  icontp = TSContCreate(stats_dostuff, TSMutexCreate());
-  my_state = (stats_state *) TSmalloc(sizeof(*my_state));
-  memset(my_state, 0, sizeof(*my_state));
-  TSContDataSet(icontp, my_state);
-  TSHttpTxnIntercept(icontp, txnp);
-  goto cleanup;
-
- notforme:
-
- cleanup:
-  if(url_loc) TSHandleMLocRelease(reqp, hdr_loc, url_loc);
-  if(hdr_loc) TSHandleMLocRelease(reqp, TS_NULL_MLOC, hdr_loc);
-
-  TSHttpTxnReenable(txnp, reenable);
   return 0;
 }
 
@@ -479,12 +504,10 @@ TSPluginInit(int argc, const char *argv[])
 
   if (TSPluginRegister(TS_SDK_VERSION_3_0, &info) != TS_SUCCESS) {
     fatal("plugin registration failed.");
-    return;
   }
 
   if (!check_ts_version()) {
     fatal("plugin requires Traffic Server 3.0.0 or later");
-    return;
   }
 
   if (!log) {
@@ -495,13 +518,11 @@ TSPluginInit(int argc, const char *argv[])
     TSTextLogObjectWrite(log, (char *)"%s(%s) plugin starting...",
                          PLUGIN_NAME, PLUGIN_VERSION);
   }
-  debug("%s(%s) plugin starting...", PLUGIN_NAME, PLUGIN_VERSION);
+  info("%s(%s) plugin starting...", PLUGIN_NAME, PLUGIN_VERSION);
 
-  TSHttpHookAdd(TS_HTTP_READ_REQUEST_HDR_HOOK, TSContCreate(api_origin, NULL));
-  debug_api("stats api module registered");
+  stats_map_mutex = TSMutexCreate();
 
-  // TSCont cont = TSContCreate(handle_hook, TSMutexCreate());  we do not have global contp data
-  TSCont cont = TSContCreate(handle_hook, NULL);
+  TSCont cont = TSContCreate(handle_event, NULL);
   TSHttpHookAdd(TS_HTTP_READ_REQUEST_HDR_HOOK, cont);
 }
 
