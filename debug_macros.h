@@ -19,7 +19,8 @@
 #ifndef _DBG_MACROS_H
 #define _DBG_MACROS_H
 
-// #include <ts/ts.h>
+#define __STDC_FORMAT_MACROS
+#include <inttypes.h>
 
 #define TAG PLUGIN_NAME
 #define API_TAG PLUGIN_NAME ".api"

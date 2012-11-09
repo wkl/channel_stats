@@ -9,14 +9,16 @@
   Created by Conan Wang <buaawkl@gmail.com> on 2012-11-05.
 */
 
+#define __STDC_LIMIT_MACROS
+
 #include <cstdio>
 #include <cstring>
 #include <string>
-#include <inttypes.h>
 // #include <ext/hash_map>
 #include <map>
+#include <vector>
+#include <algorithm>
 #include <sstream>
-#define __STDC_FORMAT_MACROS
 
 #include <ts/ts.h>
 #include <ts/experimental.h>
@@ -42,24 +44,24 @@ struct channel_stat {
   channel_stat()
       : response_bytes_content(0), 
         response_count_2xx(0),
-        speed_ua_bytes_per_sec_50k(0) {
+        speed_ua_bytes_per_sec_64k(0) {
   }
 
-  inline void increment(uint64_t rbc, uint64_t rc2, uint64_t sbps5) {
+  inline void increment(uint64_t rbc, uint64_t rc2, uint64_t sbps6) {
     __sync_fetch_and_add(&response_bytes_content, rbc);
     if (rc2) __sync_fetch_and_add(&response_count_2xx, rc2);
-    if (sbps5) __sync_fetch_and_add(&speed_ua_bytes_per_sec_50k, sbps5);
+    if (sbps6) __sync_fetch_and_add(&speed_ua_bytes_per_sec_64k, sbps6);
   }
 
   void debug_channel() {
     debug("response.bytes.content: %" PRIu64 "", response_bytes_content);
     debug("response.count.2xx: %" PRIu64 "", response_count_2xx);
-    debug("speed.ua.bytes_per_sec_50k: %" PRIu64 "", speed_ua_bytes_per_sec_50k);
+    debug("speed.ua.bytes_per_sec_64k: %" PRIu64 "", speed_ua_bytes_per_sec_64k);
   }
 
   uint64_t response_bytes_content;
   uint64_t response_count_2xx;
-  uint64_t speed_ua_bytes_per_sec_50k;
+  uint64_t speed_ua_bytes_per_sec_64k;
 };
 
 // using namespace __gnu_cxx;
@@ -85,6 +87,10 @@ typedef struct intercept_state_t
 
   int output_bytes;
   int body_written;
+
+  int show_global;
+  char * channel;
+  int topn;
 } intercept_state;
 
 static int handle_event(TSCont contp, TSEvent event, void *edata);
@@ -97,6 +103,121 @@ destroy_cdata(cdata * cd)
     TSfree(cd->host);
     TSfree(cd);
   }
+}
+
+/*
+  Get the value of parameter in url querystring
+  Return 0 and a null string if not find the parameter.
+  Return 1 and a value string, normally
+  Return 2 and a max_length value string if the length of the value exceeds.
+
+  Possible appearance: ?param=value&fake_param=value&param=value
+*/
+static int
+get_query_param(const char *query, const char *param, 
+                char *result, int max_length)
+{
+  char *pos = 0;
+
+  pos = strstr(query, param); /* try to find in querystring of url */
+  if (pos != query) {
+    /* if param is not prefix of querystring */
+    while (pos && *(pos - 1) != '&') { /* param must be after '&' */
+        pos = strstr(pos + strlen(param), param); /* try next */
+    }
+  }
+
+  if (!pos) {
+    /* set it null string if not found */
+    result[0] = '\0';
+    return 0; 
+  }
+
+  pos += strlen(param); /* skip 'param=' */
+
+  /* copy value of param */
+  int now = 0;
+  while (*pos != '\0' && *pos != '&' && now < max_length) {
+    result[now++] = *pos;
+    pos++;
+  }
+  result[now] = '\0'; /* make sure null-terminated */
+
+  if (*pos != '\0' && *pos != '&' && now == max_length)
+    return 2;
+  else
+    return 1;
+}
+
+static int
+has_query_param(const char *query, const char *param, int has_no_value)
+{
+  char *pos = 0;
+
+  pos = strstr(query, param); /* try to find in querystring of url */
+  if (pos != query) {
+    /* if param is not prefix of querystring */
+    while (pos && *(pos - 1) != '&') { /* param must be after '&' */
+        pos = strstr(pos + strlen(param), param); /* try next */
+    }
+  }
+
+  if (!pos)
+    return 0;
+
+  pos += strlen(param); /* skip 'param=' */
+
+  if (has_no_value) {
+    if (*pos == '\0' || *pos == '&') return 1;
+  } else {
+    if (*pos == '=') return 1;
+  }
+
+  return 0;
+}
+
+static void
+get_api_params(TSMBuffer   bufp, 
+               TSMLoc      url_loc,
+               int *       show_global,
+               char *      channel,
+               int *       topn)
+{
+  const char * query; // not null-terminated, get from TS api
+  char * tmp_query = NULL; // null-terminated
+  int query_len = 0;
+  std::stringstream ss;
+
+  *show_global = 0;
+  *topn = -1;
+
+  query = TSUrlHttpQueryGet(bufp, url_loc, &query_len);
+  if (query_len == 0)
+    return;
+  tmp_query = TSstrndup(query, query_len);
+  debug("querystring: %s", tmp_query);
+
+  if (has_query_param(tmp_query, "global", 1)) {
+    debug("found 'global' param");
+    *show_global = 1;
+  }
+
+  channel = (char *) TSmalloc(query_len);
+  if (get_query_param(tmp_query, "channel=", channel, query_len)) {
+    debug("found 'channel' param: %s", channel);
+  }
+
+  char * tmp_topn = (char *) TSmalloc(query_len);
+  if (get_query_param(tmp_query, "topn=", tmp_topn, 10)) {
+    if (strlen(tmp_topn) > 0) {
+      ss.str(tmp_topn);
+      ss >> *topn;
+    }
+    debug("found 'topn' param: %d", *topn);
+  }
+
+  TSfree(tmp_query);
+  TSfree(tmp_topn);
 }
 
 static void
@@ -125,7 +246,6 @@ handle_read_req(TSCont contp, TSHttpTxn txnp)
     goto cleanup;
 
   path = TSUrlPathGet(bufp, url_loc, &path_len);
-
   if (path_len == 0 || (unsigned)path_len != api_path.length() ||
         strncmp(api_path.c_str(), path, path_len) != 0) {
     goto not_api;
@@ -135,10 +255,12 @@ handle_read_req(TSCont contp, TSHttpTxn txnp)
 
   /* register our intercept */
   debug_api("Intercepting request");
-
   api_contp = TSContCreate(api_handle_event, TSMutexCreate());
   api_state = (intercept_state *) TSmalloc(sizeof(*api_state));
   memset(api_state, 0, sizeof(*api_state));
+  get_api_params(bufp, url_loc, 
+                 &api_state->show_global, api_state->channel,
+                 &api_state->topn);
   TSContDataSet(api_contp, api_state);
   TSHttpTxnIntercept(api_contp, txnp);
 
@@ -189,7 +311,7 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
   std::stringstream ss;
 
   if (TSHttpTxnClientRespGet(txnp, &bufp, &hdr_loc) != TS_SUCCESS) {
-    warning("couldn't retrieve final response");
+    debug("couldn't retrieve final response");
     return;
   }
 
@@ -244,7 +366,7 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
     stat = stat_it->second;
   }
 
-  stat->increment(body_bytes, 1, user_speed < 50000 ? 1 : 0);
+  stat->increment(body_bytes, 1, user_speed < 64000 ? 1 : 0);
   stat->debug_channel();
 
 cleanup:
@@ -289,6 +411,8 @@ stats_cleanup(TSCont contp, intercept_state * api_state)
     TSIOBufferDestroy(api_state->resp_buffer);
     api_state->resp_buffer = NULL;
   }
+
+  TSfree(api_state->channel);
   TSVConnClose(api_state->net_vc);
   TSfree(api_state);
   TSContDestroy(contp);
@@ -382,24 +506,66 @@ json_out_stat(TSRecordType rec_type, void *edata, int registered,
   }
 }
 
+template<class T>
+struct compare
+: std::binary_function<T,T,bool>
+{
+   inline bool operator()(const T& lhs, const T& rhs) {
+      return lhs.second->response_count_2xx > rhs.second->response_count_2xx;
+   }
+};
+
+static void
+append_channel_stat(intercept_state * api_state,
+                    const std::string channel, channel_stat * cs,
+                    int is_last)
+{
+  APPEND_DICT_NAME(channel.c_str());
+  APPEND_STAT("response.bytes.content", "%" PRIu64, cs->response_bytes_content);
+  APPEND_STAT("response.count.2xx.get", "%" PRIu64, cs->response_count_2xx);
+  APPEND_END_STAT("speed.ua.bytes_per_sec_64k", "%" PRIu64, cs->speed_ua_bytes_per_sec_64k);
+  if (is_last)
+    APPEND("}\n");
+  else
+    APPEND("},\n");
+}
+
 static void
 json_out_channel_stats(intercept_state * api_state) {
-  // XXX may need lock for large numbers of (dynamic) channel
+  // XXX may need lock for large numbers of growing channel
+  // XXX truncate result? (limit the number of outputed channel)
+
   if (channel_stats.empty())
     return;
 
-  iterator last_it = channel_stats.end();
-  last_it--;
-  for (iterator it=channel_stats.begin(); it != channel_stats.end(); it++) {
-    debug("appending: '%s' stats", it->first.c_str());
-    APPEND_DICT_NAME(it->first.c_str());
-    APPEND_STAT("response.bytes.content", "%" PRIu64, it->second->response_bytes_content);
-    APPEND_STAT("response.count.2xx.get", "%" PRIu64, it->second->response_count_2xx);
-    APPEND_END_STAT("speed.ua.bytes_per_sec_50k", "%" PRIu64, it->second->speed_ua_bytes_per_sec_50k);
-    if (it == last_it)
-      APPEND("}\n");
-    else
-      APPEND("},\n");
+  typedef std::pair<std::string, channel_stat *> data_t;
+  typedef std::vector<data_t> vec_t;
+
+  debug("appending channel stats");
+
+  if (api_state->topn > -1) {
+    if (api_state->topn == 0)
+      return;
+
+    vec_t stats_vec(channel_stats.begin(), channel_stats.end());
+    std::sort(stats_vec.begin(), stats_vec.end(), compare<data_t>());
+
+    vec_t::size_type out_st = (unsigned)api_state->topn > stats_vec.size() ? \
+                                            stats_vec.size() : api_state->topn;
+    vec_t::size_type i = 0;
+    for (; i < out_st - 1; i++) {
+      append_channel_stat(api_state, stats_vec[i].first, stats_vec[i].second, 0);
+    }
+    append_channel_stat(api_state, stats_vec[i].first, stats_vec[i].second, 1);
+
+  } else {
+    iterator last_it = channel_stats.end();
+    last_it--;
+    iterator it=channel_stats.begin();
+    for (; it != last_it; it++) {
+      append_channel_stat(api_state, it->first, it->second, 0);
+    }
+    append_channel_stat(api_state, it->first, it->second, 1);
   }
 }
 
@@ -407,16 +573,22 @@ static void
 json_out_stats(intercept_state * api_state)
 {
   const char *version;
+
   APPEND("{ \"channel\": {\n");
   json_out_channel_stats(api_state);
   APPEND("  },\n");
+
   APPEND(" \"global\": {\n");
-  TSRecordDump(TS_RECORDTYPE_PROCESS, json_out_stat, api_state);
-  version = TSTrafficServerVersionGet();
   APPEND_STAT("response.count.2xx.get", "%" PRIu64, global_response_count_2xx_get);
+
+  if (api_state->show_global)
+    TSRecordDump(TS_RECORDTYPE_PROCESS, json_out_stat, api_state); // internal stats
+
+  version = TSTrafficServerVersionGet();
   APPEND("\"server\": \"");
   APPEND(version);
   APPEND("\"\n");
+
   APPEND("  }\n}\n");
 }
 
