@@ -28,6 +28,8 @@
 #define PLUGIN_NAME     "channel_stats"
 #define PLUGIN_VERSION  "0.1"
 
+#define MAX_SPEED 999999999
+
 static std::string api_path = "_cstats";
 static TSTextLogObject log;
 
@@ -338,9 +340,10 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
     goto cleanup;
   }
 
-  user_speed = (interval_time == 0) ? body_bytes : (int)((float)body_bytes / interval_time * TS_HRTIME_SECOND);
-  if (!user_speed) // body_bytes may = 0
-    user_speed = 100000000;
+  if (interval_time == 0 || body_bytes == 0)
+    user_speed = MAX_SPEED;
+  else
+    user_speed = (int)((float)body_bytes / interval_time * TS_HRTIME_SECOND);
 
   __sync_fetch_and_add(&global_response_count_2xx_get, 1);
 
