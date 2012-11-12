@@ -32,7 +32,6 @@ static std::string api_path = "_cstats";
 static TSTextLogObject log;
 
 struct cdata {
-  // const char * method; TODO only count GET
   char * host;
 };
 
@@ -229,6 +228,8 @@ handle_read_req(TSCont contp, TSHttpTxn txnp)
   TSMLoc host_field_loc = NULL;
   const char* host_field;
   int host_field_length = 0;
+  const char *method;
+  int method_length = 0;
   TSCont txn_contp;
 
   const char * path;
@@ -239,6 +240,12 @@ handle_read_req(TSCont contp, TSHttpTxn txnp)
 
   if (TSHttpTxnClientReqGet(txnp, &bufp, &hdr_loc) != TS_SUCCESS) {
     error("couldn't retrieve client's request");
+    goto cleanup;
+  }
+
+  method = TSHttpHdrMethodGet(bufp, hdr_loc, &method_length);
+  if (0 != strncmp(method, TS_HTTP_METHOD_GET, method_length)) {
+    debug("do not count %.*s method", method_length, method);
     goto cleanup;
   }
 
@@ -339,9 +346,9 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
 
   debug("origin host in ContData: %s", host.c_str());
   debug("body bytes: %" PRIu64 "", body_bytes);
-  // debug("start time: %" PRId64 "", start_time);
-  // debug("end time: %" PRId64 "", end_time);
-  // debug("interval time: %" PRId64 "", interval_time);
+  debug("start time: %" PRId64 "", start_time);
+  debug("end time: %" PRId64 "", end_time);
+  debug("interval time: %" PRId64 "", interval_time);
   debug("interval seconds: %.5f", interval_time / (float)TS_HRTIME_SECOND);
   debug("speed bytes per second: %" PRIu64 "", user_speed);
   debug("2xx req count: %" PRIu64 "", global_response_count_2xx_get);
