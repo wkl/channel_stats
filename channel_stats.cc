@@ -89,9 +89,9 @@ typedef struct intercept_state_t
   int output_bytes;
   int body_written;
 
-  int show_global;
-  char * channel;
-  int topn;
+  int show_global; // default 0
+  char * channel; // default ""
+  int topn; // default -1
 } intercept_state;
 
 static int handle_event(TSCont contp, TSEvent event, void *edata);
@@ -150,6 +150,12 @@ get_query_param(const char *query, const char *param,
     return 1;
 }
 
+/*
+  check if exist param in query string
+
+  Possible querystring: ?param1=value1&param2
+  (param2 is a param which "has_no_value")
+*/
 static int
 has_query_param(const char *query, const char *param, int has_no_value)
 {
@@ -181,7 +187,7 @@ static void
 get_api_params(TSMBuffer   bufp, 
                TSMLoc      url_loc,
                int *       show_global,
-               char *      channel,
+               char **     channel,
                int *       topn)
 {
   const char * query; // not null-terminated, get from TS api
@@ -203,9 +209,9 @@ get_api_params(TSMBuffer   bufp,
     *show_global = 1;
   }
 
-  channel = (char *) TSmalloc(query_len);
-  if (get_query_param(tmp_query, "channel=", channel, query_len)) {
-    debug("found 'channel' param: %s", channel);
+  *channel = (char *) TSmalloc(query_len);
+  if (get_query_param(tmp_query, "channel=", *channel, query_len)) {
+    debug("found 'channel' param: %s", *channel);
   }
 
   char * tmp_topn = (char *) TSmalloc(query_len);
@@ -268,7 +274,7 @@ handle_read_req(TSCont contp, TSHttpTxn txnp)
   api_state = (intercept_state *) TSmalloc(sizeof(*api_state));
   memset(api_state, 0, sizeof(*api_state));
   get_api_params(bufp, url_loc, 
-                 &api_state->show_global, api_state->channel,
+                 &api_state->show_global, &api_state->channel,
                  &api_state->topn);
   TSContDataSet(api_contp, api_state);
   TSHttpTxnIntercept(api_contp, txnp);
@@ -316,8 +322,7 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
   std::pair<iterator,bool> insert_ret;
   cdata * cd = (cdata *) TSContDataGet(contp);
   std::string host = std::string(cd->host);
-  // tbr
-  std::stringstream ss;
+  std::stringstream ss; // for test, to be removed
 
   if (TSHttpTxnClientRespGet(txnp, &bufp, &hdr_loc) != TS_SUCCESS) {
     debug("couldn't retrieve final response");
@@ -356,9 +361,9 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
   debug("speed bytes per second: %" PRIu64 "", user_speed);
   debug("2xx req count: %" PRIu64 "", global_response_count_2xx_get);
 
-  // ss << (rand() % 1000);
+  // ss << (rand() % 100);
   // host = host + "--" + ss.str();
-  debug("%s", host.c_str());
+  // debug("%s", host.c_str());
   stat_it = channel_stats.find(host);
   if (stat_it == channel_stats.end()) {
     stat = new channel_stat();
@@ -553,15 +558,36 @@ json_out_channel_stats(intercept_state * api_state) {
 
   debug("appending channel stats");
 
-  if (api_state->topn > -1) {
+  if (api_state->topn > -1 || 
+      (api_state->channel && strlen(api_state->channel) > 0)) {
+    // will use vector to output
+
     if (api_state->topn == 0)
       return;
 
-    vec_t stats_vec(channel_stats.begin(), channel_stats.end());
-    std::sort(stats_vec.begin(), stats_vec.end(), compare<data_t>());
+    vec_t stats_vec; // a tmp vector to sort or filter
+    if (strlen(api_state->channel) > 0) {
+      // filter by channel
+      size_t found;
+      for (iterator it=channel_stats.begin(); it != channel_stats.end(); it++) {
+        found = it->first.find(api_state->channel);
+        if (found != std::string::npos)
+          stats_vec.push_back(*it);
+      }
+    } else {
+      stats_vec.assign(channel_stats.begin(), channel_stats.end());
+    }
 
-    vec_t::size_type out_st = (unsigned)api_state->topn > stats_vec.size() ? \
-                                            stats_vec.size() : api_state->topn;
+    if (stats_vec.empty())
+      return;  // or out_st -1 below will overflow
+
+    vec_t::size_type out_st = stats_vec.size();
+    if (api_state->topn > 0) { // need sort and limit output size
+      std::sort(stats_vec.begin(), stats_vec.end(), compare<data_t>());
+      if ((unsigned)api_state->topn < stats_vec.size())
+        out_st = (unsigned)api_state->topn;
+    } // else will output whole vector without sort
+
     vec_t::size_type i = 0;
     for (; i < out_st - 1; i++) {
       append_channel_stat(api_state, stats_vec[i].first, stats_vec[i].second, 0);
