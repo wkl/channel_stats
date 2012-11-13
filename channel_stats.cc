@@ -30,6 +30,9 @@
 
 #define MAX_SPEED 999999999
 
+// limit the number of channels (items) for potential attack
+#define MAX_MAP_SIZE 100000
+
 static std::string api_path = "_cstats";
 static TSTextLogObject log;
 
@@ -43,7 +46,7 @@ uint64_t global_response_count_2xx_get = 0;  // 2XX GET response count
 // channel stats
 struct channel_stat {
   channel_stat()
-      : response_bytes_content(0), 
+      : response_bytes_content(0),
         response_count_2xx(0),
         speed_ua_bytes_per_sec_64k(0) {
   }
@@ -75,7 +78,6 @@ static stats_map_type channel_stats;
 static TSMutex stats_map_mutex;
 
 // api Intercept Data
-
 typedef struct intercept_state_t
 {
   TSVConn net_vc;
@@ -115,7 +117,7 @@ destroy_cdata(cdata * cd)
   Possible appearance: ?param=value&fake_param=value&param=value
 */
 static int
-get_query_param(const char *query, const char *param, 
+get_query_param(const char *query, const char *param,
                 char *result, int max_length)
 {
   char *pos = 0;
@@ -131,7 +133,7 @@ get_query_param(const char *query, const char *param,
   if (!pos) {
     /* set it null string if not found */
     result[0] = '\0';
-    return 0; 
+    return 0;
   }
 
   pos += strlen(param); /* skip 'param=' */
@@ -184,7 +186,7 @@ has_query_param(const char *query, const char *param, int has_no_value)
 }
 
 static void
-get_api_params(TSMBuffer   bufp, 
+get_api_params(TSMBuffer   bufp,
                TSMLoc      url_loc,
                int *       show_global,
                char **     channel,
@@ -193,7 +195,6 @@ get_api_params(TSMBuffer   bufp,
   const char * query; // not null-terminated, get from TS api
   char * tmp_query = NULL; // null-terminated
   int query_len = 0;
-  std::stringstream ss;
 
   *show_global = 0;
   *topn = -1;
@@ -202,25 +203,26 @@ get_api_params(TSMBuffer   bufp,
   if (query_len == 0)
     return;
   tmp_query = TSstrndup(query, query_len);
-  debug("querystring: %s", tmp_query);
+  debug_api("querystring: %s", tmp_query);
 
   if (has_query_param(tmp_query, "global", 1)) {
-    debug("found 'global' param");
+    debug_api("found 'global' param");
     *show_global = 1;
   }
 
   *channel = (char *) TSmalloc(query_len);
   if (get_query_param(tmp_query, "channel=", *channel, query_len)) {
-    debug("found 'channel' param: %s", *channel);
+    debug_api("found 'channel' param: %s", *channel);
   }
 
+  std::stringstream ss;
   char * tmp_topn = (char *) TSmalloc(query_len);
   if (get_query_param(tmp_query, "topn=", tmp_topn, 10)) {
     if (strlen(tmp_topn) > 0) {
       ss.str(tmp_topn);
       ss >> *topn;
     }
-    debug("found 'topn' param: %d", *topn);
+    debug_api("found 'topn' param: %d", *topn);
   }
 
   TSfree(tmp_query);
@@ -265,7 +267,7 @@ handle_read_req(TSCont contp, TSHttpTxn txnp)
         strncmp(api_path.c_str(), path, path_len) != 0) {
     goto not_api;
   }
-  
+
   TSSkipRemappingSet(txnp, 1); //not strictly necessary, but speed is everything these days
 
   /* register our intercept */
@@ -273,7 +275,7 @@ handle_read_req(TSCont contp, TSHttpTxn txnp)
   api_contp = TSContCreate(api_handle_event, TSMutexCreate());
   api_state = (intercept_state *) TSmalloc(sizeof(*api_state));
   memset(api_state, 0, sizeof(*api_state));
-  get_api_params(bufp, url_loc, 
+  get_api_params(bufp, url_loc,
                  &api_state->show_global, &api_state->channel,
                  &api_state->topn);
   TSContDataSet(api_contp, api_state);
@@ -283,10 +285,10 @@ handle_read_req(TSCont contp, TSHttpTxn txnp)
 
 not_api:
 
-  host_field_loc = TSMimeHdrFieldFind(bufp, hdr_loc, 
+  host_field_loc = TSMimeHdrFieldFind(bufp, hdr_loc,
                                       TS_MIME_FIELD_HOST, TS_MIME_LEN_HOST);
   if (host_field_loc) {
-    host_field = TSMimeHdrFieldValueStringGet(bufp, hdr_loc, host_field_loc, 
+    host_field = TSMimeHdrFieldValueStringGet(bufp, hdr_loc, host_field_loc,
                                               0, &host_field_length);
   } else {
     warning("no valid host header");
@@ -362,10 +364,15 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
   debug("2xx req count: %" PRIu64 "", global_response_count_2xx_get);
 
   // ss << (rand() % 100);
+  // ss << channel_stats.size() + 1;
   // host = host + "--" + ss.str();
   // debug("%s", host.c_str());
   stat_it = channel_stats.find(host);
   if (stat_it == channel_stats.end()) {
+    if (channel_stats.size() >= MAX_MAP_SIZE) {
+      warning("channels_stats map exceed max size");
+      goto cleanup;
+    }
     stat = new channel_stat();
     TSMutexLock(stats_map_mutex);
     insert_ret = channel_stats.insert(std::make_pair(host, stat));
@@ -375,7 +382,7 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
       delete stat;
       stat = insert_ret.first->second;
     } else {
-      debug("*********** new channel ***********");
+      debug("********** new channel(%zu) **********", channel_stats.size());
     }
   } else { // found
     stat = stat_it->second;
@@ -547,9 +554,6 @@ append_channel_stat(intercept_state * api_state,
 
 static void
 json_out_channel_stats(intercept_state * api_state) {
-  // XXX may need lock for large numbers of growing channel
-  // XXX truncate result? (limit the number of outputed channel)
-
   if (channel_stats.empty())
     return;
 
@@ -558,9 +562,8 @@ json_out_channel_stats(intercept_state * api_state) {
 
   debug("appending channel stats");
 
-  if (api_state->topn > -1 || 
-      (api_state->channel && strlen(api_state->channel) > 0)) {
-    // will use vector to output
+  if (api_state->topn > -1 ||
+      (api_state->channel && strlen(api_state->channel) > 0)) { // will use vector to output
 
     if (api_state->topn == 0)
       return;
@@ -575,7 +578,10 @@ json_out_channel_stats(intercept_state * api_state) {
           stats_vec.push_back(*it);
       }
     } else {
-      stats_vec.assign(channel_stats.begin(), channel_stats.end());
+      for (iterator it=channel_stats.begin(); it != channel_stats.end(); it++)
+        stats_vec.push_back(*it);
+      /* stats_vec.assign(channel_stats.begin(), channel_stats.end());
+      not safe when channel_stats map is being inserting concurrently */
     }
 
     if (stats_vec.empty())
@@ -676,7 +682,7 @@ check_ts_version()
   int result = 0;
 
   if (ts_version) {
-    int major_ts_version = 0; 
+    int major_ts_version = 0;
     int minor_ts_version = 0;
     int patch_ts_version = 0;
 
