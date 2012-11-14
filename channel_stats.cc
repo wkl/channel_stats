@@ -13,6 +13,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cctype>
 #include <string>
 // #include <ext/hash_map>
 #include <map>
@@ -30,10 +31,11 @@
 
 #define MAX_SPEED 999999999
 
-// limit the number of channels (items) for potential attack
+/* limit the number of channels (items) to avoid potential attack,
+   regex_map rule can also generate infinite channels (hosts) */
 #define MAX_MAP_SIZE 100000
 
-static std::string api_path = "_cstats";
+static std::string api_path("_cstats");
 static TSTextLogObject log;
 
 struct cdata {
@@ -290,6 +292,7 @@ not_api:
   if (host_field_loc) {
     host_field = TSMimeHdrFieldValueStringGet(bufp, hdr_loc, host_field_loc,
                                               0, &host_field_length);
+    if (host_field_length == 0) goto cleanup;
   } else {
     warning("no valid host header");
     goto cleanup;
@@ -322,9 +325,10 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
   iterator stat_it;
   channel_stat *stat;
   std::pair<iterator,bool> insert_ret;
-  cdata * cd = (cdata *) TSContDataGet(contp);
-  std::string host = std::string(cd->host);
+  cdata * cd = NULL;
+  std::string host;
   std::stringstream ss; // for test, to be removed
+  char * tmp_pos = NULL;
 
   if (TSHttpTxnClientRespGet(txnp, &bufp, &hdr_loc) != TS_SUCCESS) {
     debug("couldn't retrieve final response");
@@ -337,7 +341,20 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
     goto cleanup;
   }
 
+  cd = (cdata *) TSContDataGet(contp);
+
+  // strip trailing chars after port.  Host may be in 'test.com:80xxx' format
+  tmp_pos = strchr(cd->host, ':');
+  if (tmp_pos) {
+    tmp_pos++;
+    while (*tmp_pos && isdigit(*tmp_pos)) tmp_pos++;
+    if (*(tmp_pos - 1) == ':') tmp_pos--; // 'test.com:' case
+    *tmp_pos = '\0';
+  }
+  host = std::string(cd->host);
+
   body_bytes = TSHttpTxnClientRespBodyBytesGet(txnp);
+
   TSHttpTxnStartTimeGet(txnp, &start_time);
   TSHttpTxnEndTimeGet(txnp, &end_time);
   if ((start_time != 0 && end_time != 0) || end_time < start_time) {
@@ -354,7 +371,7 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
 
   __sync_fetch_and_add(&global_response_count_2xx_get, 1);
 
-  debug("origin host in ContData: %s", host.c_str());
+  debug("host to lookup: %s", host.c_str());
   debug("body bytes: %" PRIu64 "", body_bytes);
   debug("start time: %" PRId64 "", start_time);
   debug("end time: %" PRId64 "", end_time);
