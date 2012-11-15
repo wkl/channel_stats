@@ -20,6 +20,7 @@
 #include <vector>
 #include <algorithm>
 #include <sstream>
+#include <arpa/inet.h>
 
 #include <ts/ts.h>
 #include <ts/experimental.h>
@@ -43,7 +44,7 @@ struct cdata {
 };
 
 // global stats
-uint64_t global_response_count_2xx_get = 0;  // 2XX GET response count
+static uint64_t global_response_count_2xx_get = 0;  // 2XX GET response count
 
 // channel stats
 struct channel_stat {
@@ -96,7 +97,44 @@ typedef struct intercept_state_t
   int show_global; // default 0
   char * channel; // default ""
   int topn; // default -1
+  int deny; // default 0
 } intercept_state;
+
+struct private_seg_t {
+  struct in_addr net;
+  struct in_addr mask;
+}; 
+
+// don't put inet_addr("255.255.255.255"), see BUGS in 'man 3 inet_addr'
+static struct private_seg_t private_segs[] = {
+  {{inet_addr("10.0.0.0")}, {inet_addr("255.0.0.0")}},
+  {{inet_addr("127.0.0.0")}, {inet_addr("255.0.0.0")}},
+  {{inet_addr("172.16.0.0")}, {inet_addr("255.240.0.0")}},
+  {{inet_addr("192.168.0.0")}, {inet_addr("255.255.0.0")}}
+};
+static int num_private_segs = sizeof(private_segs) / sizeof(private_seg_t);
+
+/* all parameters are in network byte order */
+static int
+is_in_net (const struct in_addr *  addr,
+           const struct in_addr *  netaddr,
+           const struct in_addr *  netmask)
+{
+   if ((addr->s_addr & netmask->s_addr) == (netaddr->s_addr & netmask->s_addr))
+      return 1;
+   return 0;
+}
+
+static int
+is_private_ip(const struct in_addr * addr)
+{
+  int i;
+  for (i = 0; i < num_private_segs; i++) {
+    if (is_in_net(addr, &private_segs[i].net, &private_segs[i].mask))
+      return 1;
+  }
+  return 0;
+}
 
 static int handle_event(TSCont contp, TSEvent event, void *edata);
 static int api_handle_event(TSCont contp, TSEvent event, void *edata);
@@ -243,11 +281,14 @@ handle_read_req(TSCont contp, TSHttpTxn txnp)
   const char *method;
   int method_length = 0;
   TSCont txn_contp;
+  cdata * cd;
 
   const char * path;
   int path_len;
-  cdata * cd;
+  struct sockaddr * client_addr;
+  struct sockaddr_in * client_addr4;
   TSCont api_contp;
+  char * client_ip;
   intercept_state *api_state;
 
   if (TSHttpTxnClientReqGet(txnp, &bufp, &hdr_loc) != TS_SUCCESS) {
@@ -270,16 +311,32 @@ handle_read_req(TSCont contp, TSHttpTxn txnp)
     goto not_api;
   }
 
-  TSSkipRemappingSet(txnp, 1); //not strictly necessary, but speed is everything these days
-
   /* register our intercept */
   debug_api("Intercepting request");
-  api_contp = TSContCreate(api_handle_event, TSMutexCreate());
   api_state = (intercept_state *) TSmalloc(sizeof(*api_state));
   memset(api_state, 0, sizeof(*api_state));
   get_api_params(bufp, url_loc,
                  &api_state->show_global, &api_state->channel,
                  &api_state->topn);
+
+  /* check private ip */
+  client_addr = (struct sockaddr *) TSHttpTxnClientAddrGet(txnp);
+  if (client_addr->sa_family == AF_INET) {
+    client_addr4 = (struct sockaddr_in *) client_addr;
+    if (!is_private_ip(&client_addr4->sin_addr)) {
+      client_ip = (char *) TSmalloc(INET_ADDRSTRLEN);
+      inet_ntop(AF_INET, &client_addr4->sin_addr, client_ip, INET_ADDRSTRLEN);
+      debug_api("%s is not a private IP, request denied", client_ip);
+      api_state->deny = 1;
+      TSfree(client_ip);
+    }
+  } else {
+    debug_api("not IPv4, ignore IP auth"); // TODO check AF_INET6 private IP?
+  }
+
+  TSSkipRemappingSet(txnp, 1); //not strictly necessary, but speed is everything these days
+
+  api_contp = TSContCreate(api_handle_event, TSMutexCreate());
   TSContDataSet(api_contp, api_state);
   TSHttpTxnIntercept(api_contp, txnp);
 
@@ -348,19 +405,27 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
   if (tmp_pos) {
     tmp_pos++;
     while (*tmp_pos && isdigit(*tmp_pos)) tmp_pos++;
-    if (*(tmp_pos - 1) == ':') tmp_pos--; // 'test.com:' case
+    if (*(tmp_pos - 1) == ':')
+      tmp_pos--; // 'test.com:' case
+    else if (*(tmp_pos - 1) == '0' && *(tmp_pos - 2) == '8' && *(tmp_pos -3) == ':')
+      tmp_pos -= 3; // unify 'test.com:80' to 'test.com'
     *tmp_pos = '\0';
   }
   host = std::string(cd->host);
 
   body_bytes = TSHttpTxnClientRespBodyBytesGet(txnp);
+  __sync_fetch_and_add(&global_response_count_2xx_get, 1);
+
+  debug("host to lookup: %s", host.c_str());
+  debug("body bytes: %" PRIu64 "", body_bytes);
+  debug("2xx req count: %" PRIu64 "", global_response_count_2xx_get);
 
   TSHttpTxnStartTimeGet(txnp, &start_time);
   TSHttpTxnEndTimeGet(txnp, &end_time);
-  if ((start_time != 0 && end_time != 0) || end_time < start_time) {
+  if (start_time != 0 && end_time != 0 && end_time >= start_time) {
     interval_time = end_time - start_time;
   } else {
-    error("not valid time, start: %"PRId64", end: %"PRId64"", start_time, end_time);
+    warning("not valid time, start: %"PRId64", end: %"PRId64"", start_time, end_time);
     goto cleanup;
   }
 
@@ -369,16 +434,11 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
   else
     user_speed = (int)((float)body_bytes / interval_time * TS_HRTIME_SECOND);
 
-  __sync_fetch_and_add(&global_response_count_2xx_get, 1);
-
-  debug("host to lookup: %s", host.c_str());
-  debug("body bytes: %" PRIu64 "", body_bytes);
   debug("start time: %" PRId64 "", start_time);
   debug("end time: %" PRId64 "", end_time);
   debug("interval time: %" PRId64 "", interval_time);
   debug("interval seconds: %.5f", interval_time / (float)TS_HRTIME_SECOND);
   debug("speed bytes per second: %" PRIu64 "", user_speed);
-  debug("2xx req count: %" PRIu64 "", global_response_count_2xx_get);
 
   // ss << (rand() % 100);
   // ss << channel_stats.size() + 1;
@@ -658,7 +718,10 @@ stats_process_write(TSCont contp, TSEvent event, intercept_state * api_state)
     if (api_state->body_written == 0) {
       debug_api("plugin adding response body");
       api_state->body_written = 1;
-      json_out_stats(api_state);
+      if (!api_state->deny)
+        json_out_stats(api_state);
+      else
+        APPEND("forbidden");
       TSVIONBytesSet(api_state->write_vio, api_state->output_bytes);
     }
     TSVIOReenable(api_state->write_vio);
