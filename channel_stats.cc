@@ -6,17 +6,17 @@
   the future) for each channel. The stats is exposed with http interface.
   (the code of interface is from 'stats_over_http' plugin)
 
-  Created by Conan Wang <buaawkl@gmail.com> on 2012-11-05.
+  Created by Conan Wang <conanmind@gmail.com> on 2012-11-05.
 */
 
+// get INT64_MAX
 #define __STDC_LIMIT_MACROS
 
 #include <cstdio>
 #include <cstring>
 #include <cctype>
 #include <string>
-// #include <ext/hash_map>
-#include <map>
+#include <map> // may optimize by using hash_map, but mind compiler portability
 #include <vector>
 #include <algorithm>
 #include <sstream>
@@ -37,11 +37,6 @@
 #define MAX_MAP_SIZE 100000
 
 static std::string api_path("_cstats");
-static TSTextLogObject log;
-
-struct cdata {
-  char * host;
-};
 
 // global stats
 static uint64_t global_response_count_2xx_get = 0;  // 2XX GET response count
@@ -60,7 +55,7 @@ struct channel_stat {
     if (sbps6) __sync_fetch_and_add(&speed_ua_bytes_per_sec_64k, sbps6);
   }
 
-  void debug_channel() {
+  inline void debug_channel() {
     debug("response.bytes.content: %" PRIu64 "", response_bytes_content);
     debug("response.count.2xx: %" PRIu64 "", response_count_2xx);
     debug("speed.ua.bytes_per_sec_64k: %" PRIu64 "", speed_ua_bytes_per_sec_64k);
@@ -71,11 +66,8 @@ struct channel_stat {
   uint64_t speed_ua_bytes_per_sec_64k;
 };
 
-// using namespace __gnu_cxx;
-// typedef __gnu_cxx::hash_map<std::string, channel_stat> stats_map_type;
 typedef std::map<std::string, channel_stat *> stats_map_type;
-typedef stats_map_type::const_iterator const_iterator;
-typedef stats_map_type::iterator iterator;
+typedef stats_map_type::iterator smap_iterator;
 
 static stats_map_type channel_stats;
 static TSMutex stats_map_mutex;
@@ -103,7 +95,7 @@ typedef struct intercept_state_t
 struct private_seg_t {
   struct in_addr net;
   struct in_addr mask;
-}; 
+};
 
 // don't put inet_addr("255.255.255.255"), see BUGS in 'man 3 inet_addr'
 static struct private_seg_t private_segs[] = {
@@ -114,7 +106,7 @@ static struct private_seg_t private_segs[] = {
 };
 static int num_private_segs = sizeof(private_segs) / sizeof(private_seg_t);
 
-/* all parameters are in network byte order */
+// all parameters are in network byte order
 static int
 is_in_net (const struct in_addr *  addr,
            const struct in_addr *  netaddr,
@@ -139,15 +131,6 @@ is_private_ip(const struct in_addr * addr)
 static int handle_event(TSCont contp, TSEvent event, void *edata);
 static int api_handle_event(TSCont contp, TSEvent event, void *edata);
 
-static void
-destroy_cdata(cdata * cd)
-{
-  if (cd) {
-    TSfree(cd->host);
-    TSfree(cd);
-  }
-}
-
 /*
   Get the value of parameter in url querystring
   Return 0 and a null string if not find the parameter.
@@ -162,29 +145,29 @@ get_query_param(const char *query, const char *param,
 {
   char *pos = 0;
 
-  pos = strstr(query, param); /* try to find in querystring of url */
+  pos = strstr(query, param); // try to find in querystring of url
   if (pos != query) {
-    /* if param is not prefix of querystring */
-    while (pos && *(pos - 1) != '&') { /* param must be after '&' */
-        pos = strstr(pos + strlen(param), param); /* try next */
+    // if param is not prefix of querystring
+    while (pos && *(pos - 1) != '&') { // param must be after '&'
+        pos = strstr(pos + strlen(param), param); // try next
     }
   }
 
   if (!pos) {
-    /* set it null string if not found */
+    // set it null string if not found
     result[0] = '\0';
     return 0;
   }
 
-  pos += strlen(param); /* skip 'param=' */
+  pos += strlen(param); // skip 'param='
 
-  /* copy value of param */
+  // copy value of param
   int now = 0;
   while (*pos != '\0' && *pos != '&' && now < max_length) {
     result[now++] = *pos;
     pos++;
   }
-  result[now] = '\0'; /* make sure null-terminated */
+  result[now] = '\0'; // make sure null-terminated
 
   if (*pos != '\0' && *pos != '&' && now == max_length)
     return 2;
@@ -203,18 +186,18 @@ has_query_param(const char *query, const char *param, int has_no_value)
 {
   char *pos = 0;
 
-  pos = strstr(query, param); /* try to find in querystring of url */
+  pos = strstr(query, param); // try to find in querystring of url
   if (pos != query) {
-    /* if param is not prefix of querystring */
-    while (pos && *(pos - 1) != '&') { /* param must be after '&' */
-        pos = strstr(pos + strlen(param), param); /* try next */
+    // if param is not prefix of querystring
+    while (pos && *(pos - 1) != '&') { // param must be after '&'
+        pos = strstr(pos + strlen(param), param); // try next
     }
   }
 
   if (!pos)
     return 0;
 
-  pos += strlen(param); /* skip 'param=' */
+  pos += strlen(param); // skip 'param='
 
   if (has_no_value) {
     if (*pos == '\0' || *pos == '&') return 1;
@@ -275,13 +258,9 @@ handle_read_req(TSCont contp, TSHttpTxn txnp)
   TSMBuffer bufp;
   TSMLoc hdr_loc = NULL;
   TSMLoc url_loc = NULL;
-  TSMLoc host_field_loc = NULL;
-  const char* host_field;
-  int host_field_length = 0;
   const char *method;
   int method_length = 0;
   TSCont txn_contp;
-  cdata * cd;
 
   const char * path;
   int path_len;
@@ -311,7 +290,7 @@ handle_read_req(TSCont contp, TSHttpTxn txnp)
     goto not_api;
   }
 
-  /* register our intercept */
+  // register our intercept
   debug_api("Intercepting request");
   api_state = (intercept_state *) TSmalloc(sizeof(*api_state));
   memset(api_state, 0, sizeof(*api_state));
@@ -319,7 +298,7 @@ handle_read_req(TSCont contp, TSHttpTxn txnp)
                  &api_state->show_global, &api_state->channel,
                  &api_state->topn);
 
-  /* check private ip */
+  // check private ip
   client_addr = (struct sockaddr *) TSHttpTxnClientAddrGet(txnp);
   if (client_addr->sa_family == AF_INET) {
     client_addr4 = (struct sockaddr_in *) client_addr;
@@ -334,7 +313,7 @@ handle_read_req(TSCont contp, TSHttpTxn txnp)
     debug_api("not IPv4, ignore IP auth"); // TODO check AF_INET6 private IP?
   }
 
-  TSSkipRemappingSet(txnp, 1); //not strictly necessary, but speed is everything these days
+  TSSkipRemappingSet(txnp, 1); //not strictly necessary
 
   api_contp = TSContCreate(api_handle_event, TSMutexCreate());
   TSContDataSet(api_contp, api_state);
@@ -344,27 +323,10 @@ handle_read_req(TSCont contp, TSHttpTxn txnp)
 
 not_api:
 
-  host_field_loc = TSMimeHdrFieldFind(bufp, hdr_loc,
-                                      TS_MIME_FIELD_HOST, TS_MIME_LEN_HOST);
-  if (host_field_loc) {
-    host_field = TSMimeHdrFieldValueStringGet(bufp, hdr_loc, host_field_loc,
-                                              0, &host_field_length);
-    if (host_field_length == 0) goto cleanup;
-  } else {
-    warning("no valid host header");
-    goto cleanup;
-  }
-  debug("origin host: %.*s", host_field_length, host_field);
-
   txn_contp = TSContCreate(handle_event, NULL); // reuse global hander
-  cd = (cdata *) TSmalloc(sizeof(cdata));
-  cd->host = TSstrndup(host_field, host_field_length);
-  TSContDataSet(txn_contp, cd);
-
   TSHttpTxnHookAdd(txnp, TS_HTTP_TXN_CLOSE_HOOK, txn_contp);
 
 cleanup:
-  if (host_field_loc) TSHandleMLocRelease(bufp, hdr_loc, host_field_loc);
   if (url_loc) TSHandleMLocRelease(bufp, hdr_loc, url_loc);
   if (hdr_loc) TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc);
 }
@@ -374,44 +336,52 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
 {
   TSMBuffer bufp;
   TSMLoc hdr_loc;
+  TSHttpStatus status;
+  TSMLoc purl_loc;
+  const char * pristine_host;
+  int pristine_host_len = 0;
+  int pristine_port;
   uint64_t user_speed;
   uint64_t body_bytes;
   TSHRTime start_time = 0;
   TSHRTime end_time = 0;
   TSHRTime interval_time = 0;
-  iterator stat_it;
+  smap_iterator stat_it;
   channel_stat *stat;
-  std::pair<iterator,bool> insert_ret;
-  cdata * cd = NULL;
+  std::pair<smap_iterator, bool> insert_ret;
   std::string host;
-  std::stringstream ss; // for test, to be removed
-  char * tmp_pos = NULL;
+  std::stringstream ss;
 
   if (TSHttpTxnClientRespGet(txnp, &bufp, &hdr_loc) != TS_SUCCESS) {
     debug("couldn't retrieve final response");
     return;
   }
 
-  TSHttpStatus status = TSHttpHdrStatusGet(bufp, hdr_loc);
+  status = TSHttpHdrStatusGet(bufp, hdr_loc);
   if (status != TS_HTTP_STATUS_OK && status != TS_HTTP_STATUS_PARTIAL_CONTENT) {
     debug("only count 200/206 response");
     goto cleanup;
   }
 
-  cd = (cdata *) TSContDataGet(contp);
-
-  // strip trailing chars after port.  Host may be in 'test.com:80xxx' format
-  tmp_pos = strchr(cd->host, ':');
-  if (tmp_pos) {
-    tmp_pos++;
-    while (*tmp_pos && isdigit(*tmp_pos)) tmp_pos++;
-    if (*(tmp_pos - 1) == ':')
-      tmp_pos--; // 'test.com:' case
-    else if (*(tmp_pos - 1) == '0' && *(tmp_pos - 2) == '8' && *(tmp_pos -3) == ':')
-      tmp_pos -= 3; // unify 'test.com:80' to 'test.com'
-    *tmp_pos = '\0';
+  if (TSHttpTxnPristineUrlGet(txnp, &bufp, &purl_loc) != TS_SUCCESS) {
+    debug("couldn't retrieve pristine url");
+    goto cleanup;
   }
-  host = std::string(cd->host);
+
+  pristine_host = TSUrlHostGet(bufp, purl_loc, &pristine_host_len);
+  if (pristine_host_len == 0) {
+    debug("couldn't retrieve pristine host");
+    goto cleanup;
+  }
+  pristine_port = TSUrlPortGet(bufp, purl_loc);
+  debug("pristine host: %.*s", pristine_host_len, pristine_host);
+  debug("pristine port: %d", pristine_port);
+
+  host = std::string(pristine_host, pristine_host_len);
+  if (pristine_port != 80) {
+    ss << pristine_port;
+    host += ":" + ss.str();
+  }
 
   body_bytes = TSHttpTxnClientRespBodyBytesGet(txnp);
   __sync_fetch_and_add(&global_response_count_2xx_get, 1);
@@ -425,7 +395,7 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
   if (start_time != 0 && end_time != 0 && end_time >= start_time) {
     interval_time = end_time - start_time;
   } else {
-    warning("not valid time, start: %"PRId64", end: %"PRId64"", start_time, end_time);
+    warning("not valid time, start: %" PRId64", end: %" PRId64"", start_time, end_time);
     goto cleanup;
   }
 
@@ -447,7 +417,7 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
   stat_it = channel_stats.find(host);
   if (stat_it == channel_stats.end()) {
     if (channel_stats.size() >= MAX_MAP_SIZE) {
-      warning("channels_stats map exceed max size");
+      warning("channels_stats map exceeds max size");
       goto cleanup;
     }
     stat = new channel_stat();
@@ -483,7 +453,6 @@ handle_event(TSCont contp, TSEvent event, void *edata) {
       break;
     case TS_EVENT_HTTP_TXN_CLOSE: // for txn contp
       handle_txn_close(contp, txnp);
-      destroy_cdata((cdata *) TSContDataGet(contp));
       TSContDestroy(contp);
       break;
     default:
@@ -494,7 +463,6 @@ handle_event(TSCont contp, TSEvent event, void *edata) {
 
   return 0;
 }
-
 
 // below is api part
 
@@ -557,7 +525,7 @@ stats_process_read(TSCont contp, TSEvent event, intercept_state * api_state)
   } else if (event == TS_EVENT_ERROR) {
     error_api("stats_process_read: Received TS_EVENT_ERROR\n");
   } else if (event == TS_EVENT_VCONN_EOS) {
-    /* client may end the connection, simply return */
+    // client may end the connection, simply return
     return;
   } else if (event == TS_EVENT_NET_ACCEPT_FAILED) {
     error_api("stats_process_read: Received TS_EVENT_NET_ACCEPT_FAILED\n");
@@ -634,54 +602,54 @@ json_out_channel_stats(intercept_state * api_state) {
   if (channel_stats.empty())
     return;
 
-  typedef std::pair<std::string, channel_stat *> data_t;
-  typedef std::vector<data_t> vec_t;
+  typedef std::pair<std::string, channel_stat *> data_pair;
+  typedef std::vector<data_pair> stats_vec_t;
+  smap_iterator it;
 
   debug("appending channel stats");
 
   if (api_state->topn > -1 ||
-      (api_state->channel && strlen(api_state->channel) > 0)) { // will use vector to output
+      (api_state->channel && strlen(api_state->channel) > 0)) {
+    // will use vector to output
 
     if (api_state->topn == 0)
       return;
 
-    vec_t stats_vec; // a tmp vector to sort or filter
+    stats_vec_t stats_vec; // a tmp vector to sort or filter
     if (strlen(api_state->channel) > 0) {
       // filter by channel
       size_t found;
-      for (iterator it=channel_stats.begin(); it != channel_stats.end(); it++) {
+      for (it=channel_stats.begin(); it != channel_stats.end(); it++) {
         found = it->first.find(api_state->channel);
         if (found != std::string::npos)
           stats_vec.push_back(*it);
       }
     } else {
-      for (iterator it=channel_stats.begin(); it != channel_stats.end(); it++)
+      for (it=channel_stats.begin(); it != channel_stats.end(); it++)
         stats_vec.push_back(*it);
-      /* stats_vec.assign(channel_stats.begin(), channel_stats.end());
-      not safe when channel_stats map is being inserting concurrently */
+      /* stats_vec.assign is not safe when map is being inserted concurrently */
     }
 
     if (stats_vec.empty())
-      return;  // or out_st -1 below will overflow
+      return;
 
-    vec_t::size_type out_st = stats_vec.size();
+    stats_vec_t::size_type out_st = stats_vec.size();
     if (api_state->topn > 0) { // need sort and limit output size
-      std::sort(stats_vec.begin(), stats_vec.end(), compare<data_t>());
+      std::sort(stats_vec.begin(), stats_vec.end(), compare<data_pair>());
       if ((unsigned)api_state->topn < stats_vec.size())
         out_st = (unsigned)api_state->topn;
     } // else will output whole vector without sort
 
-    vec_t::size_type i = 0;
-    for (; i < out_st - 1; i++) {
+    stats_vec_t::size_type i;
+    for (i = 0; i < out_st - 1; i++) {
       append_channel_stat(api_state, stats_vec[i].first, stats_vec[i].second, 0);
     }
     append_channel_stat(api_state, stats_vec[i].first, stats_vec[i].second, 1);
 
   } else {
-    iterator last_it = channel_stats.end();
+    smap_iterator last_it = channel_stats.end();
     last_it--;
-    iterator it=channel_stats.begin();
-    for (; it != last_it; it++) {
+    for (it = channel_stats.begin(); it != last_it; it++) {
       append_channel_stat(api_state, it->first, it->second, 0);
     }
     append_channel_stat(api_state, it->first, it->second, 1);
@@ -771,7 +739,7 @@ check_ts_version()
       return 0;
     }
 
-    /* Need at least TS 3.0.0 */
+    // Need at least TS 3.0.0
     if (major_ts_version >= 3) {
       result = 1;
     }
@@ -794,7 +762,7 @@ TSPluginInit(int argc, const char *argv[])
 
   info.plugin_name = (char *)PLUGIN_NAME;
   info.vendor_name = (char *)"wkl";
-  info.support_email = (char *)"buaawkl@gmail.com";
+  info.support_email = (char *)"conanmind@gmail.com";
 
   if (TSPluginRegister(TS_SDK_VERSION_3_0, &info) != TS_SUCCESS) {
     fatal("plugin registration failed.");
@@ -804,14 +772,6 @@ TSPluginInit(int argc, const char *argv[])
     fatal("plugin requires Traffic Server 3.0.0 or later");
   }
 
-  if (!log) {
-    TSTextLogObjectCreate(PLUGIN_NAME, TS_LOG_MODE_ADD_TIMESTAMP, &log);
-  }
-
-  if (log) {
-    TSTextLogObjectWrite(log, (char *)"%s(%s) plugin starting...",
-                         PLUGIN_NAME, PLUGIN_VERSION);
-  }
   info("%s(%s) plugin starting...", PLUGIN_NAME, PLUGIN_VERSION);
 
   stats_map_mutex = TSMutexCreate();
