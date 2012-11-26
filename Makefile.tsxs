@@ -1,0 +1,12 @@
+TSXS?=tsxs
+
+%.so: %.cc
+	$(TSXS) -C $< -o $@
+
+all: channel_stats.so
+
+install: all
+	$(TSXS) -i -o channel_stats.so
+
+clean:
+	rm -f *.lo *.so
