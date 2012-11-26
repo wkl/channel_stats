@@ -23,7 +23,10 @@
 #include <arpa/inet.h>
 
 #include <ts/ts.h>
+#if (TS_VERSION_NUMBER < 3003001)
+// get TSHttpTxnStartTimeGet
 #include <ts/experimental.h>
+#endif
 
 #include "debug_macros.h"
 
@@ -374,9 +377,6 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
     goto cleanup;
   }
   pristine_port = TSUrlPortGet(bufp, purl_loc);
-  debug("pristine host: %.*s", pristine_host_len, pristine_host);
-  debug("pristine port: %d", pristine_port);
-
   host = std::string(pristine_host, pristine_host_len);
   if (pristine_port != 80) {
     ss << pristine_port;
@@ -386,12 +386,20 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
   body_bytes = TSHttpTxnClientRespBodyBytesGet(txnp);
   __sync_fetch_and_add(&global_response_count_2xx_get, 1);
 
+  debug("pristine host: %.*s", pristine_host_len, pristine_host);
+  debug("pristine port: %d", pristine_port);
   debug("host to lookup: %s", host.c_str());
   debug("body bytes: %" PRIu64 "", body_bytes);
   debug("2xx req count: %" PRIu64 "", global_response_count_2xx_get);
 
+#if (TS_VERSION_NUMBER < 3003001)
   TSHttpTxnStartTimeGet(txnp, &start_time);
   TSHttpTxnEndTimeGet(txnp, &end_time);
+#else
+  TSHttpTxnMilestoneGet(txnp, TS_MILESTONE_UA_BEGIN, &start_time);
+  TSHttpTxnMilestoneGet(txnp, TS_MILESTONE_UA_CLOSE, &end_time);
+#endif
+
   if (start_time != 0 && end_time != 0 && end_time >= start_time) {
     interval_time = end_time - start_time;
   } else {
@@ -402,12 +410,12 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
   if (interval_time == 0 || body_bytes == 0)
     user_speed = MAX_SPEED;
   else
-    user_speed = (int)((float)body_bytes / interval_time * TS_HRTIME_SECOND);
+    user_speed = (int)((float)body_bytes / interval_time * HRTIME_SECOND);
 
   debug("start time: %" PRId64 "", start_time);
   debug("end time: %" PRId64 "", end_time);
   debug("interval time: %" PRId64 "", interval_time);
-  debug("interval seconds: %.5f", interval_time / (float)TS_HRTIME_SECOND);
+  debug("interval seconds: %.5f", interval_time / (float)HRTIME_SECOND);
   debug("speed bytes per second: %" PRIu64 "", user_speed);
 
   /*
