@@ -1,12 +1,15 @@
 /*
-  channel_stats.cc
-  channel_stats plugin for Apache Traffic Server 3.0.0+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
 
-  This plugin collect the runtime statstics (speed, request count and more in
-  the future) for each channel. The stats is exposed with http interface.
-  (the code of interface is from 'stats_over_http' plugin)
+  http://www.apache.org/licenses/LICENSE-2.0
 
-  Created by Conan Wang <conanmind@gmail.com> on 2012-11-05.
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
 */
 
 // get INT64_MAX
@@ -43,7 +46,7 @@ static std::string api_path("_cstats");
 
 // global stats
 static uint64_t global_response_count_2xx_get = 0;  // 2XX GET response count
-static uint64_t global_response_bytes_content = 0;  // transferred bytes
+static uint64_t global_response_bytes_content = 0;  // transferred bytes (2xx.get)
 
 // channel stats
 struct channel_stat {
