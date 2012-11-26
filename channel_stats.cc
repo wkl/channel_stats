@@ -43,6 +43,7 @@ static std::string api_path("_cstats");
 
 // global stats
 static uint64_t global_response_count_2xx_get = 0;  // 2XX GET response count
+static uint64_t global_response_bytes_content = 0;  // transferred bytes
 
 // channel stats
 struct channel_stat {
@@ -385,6 +386,7 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
 
   body_bytes = TSHttpTxnClientRespBodyBytesGet(txnp);
   __sync_fetch_and_add(&global_response_count_2xx_get, 1);
+  __sync_fetch_and_add(&global_response_bytes_content, body_bytes);
 
   debug("pristine host: %.*s", pristine_host_len, pristine_host);
   debug("pristine port: %d", pristine_port);
@@ -684,6 +686,7 @@ json_out_stats(intercept_state * api_state)
 
   APPEND(" \"global\": {\n");
   APPEND_STAT("response.count.2xx.get", "%" PRIu64, global_response_count_2xx_get);
+  APPEND_STAT("response.bytes.content", "%" PRIu64, global_response_bytes_content);
   APPEND_STAT("channel.count", "%zu", channel_stats.size());
 
   if (api_state->show_global)
