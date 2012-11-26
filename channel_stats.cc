@@ -410,14 +410,20 @@ handle_txn_close(TSCont contp, TSHttpTxn txnp)
   debug("interval seconds: %.5f", interval_time / (float)TS_HRTIME_SECOND);
   debug("speed bytes per second: %" PRIu64 "", user_speed);
 
-  // ss << (rand() % 100);
-  // ss << channel_stats.size() + 1;
-  // host = host + "--" + ss.str();
-  // debug("%s", host.c_str());
+  /*
+  // test large number of channels
+  if (channel_stats.size() < MAX_MAP_SIZE)
+    ss << channel_stats.size() + 1;
+  else
+    ss << (rand() % MAX_MAP_SIZE + 1);
+  host = host + "--" + ss.str();
+  debug("%s", host.c_str()); 
+  */
+
   stat_it = channel_stats.find(host);
   if (stat_it == channel_stats.end()) {
     if (channel_stats.size() >= MAX_MAP_SIZE) {
-      warning("channels_stats map exceeds max size");
+      warning("channel_stats map exceeds max size");
       goto cleanup;
     }
     stat = new channel_stat();
@@ -635,9 +641,12 @@ json_out_channel_stats(intercept_state * api_state) {
 
     stats_vec_t::size_type out_st = stats_vec.size();
     if (api_state->topn > 0) { // need sort and limit output size
-      std::sort(stats_vec.begin(), stats_vec.end(), compare<data_pair>());
       if ((unsigned)api_state->topn < stats_vec.size())
         out_st = (unsigned)api_state->topn;
+      else
+        api_state->topn = stats_vec.size();
+      std::partial_sort(stats_vec.begin(), stats_vec.begin() + api_state->topn,
+                        stats_vec.end(), compare<data_pair>());
     } // else will output whole vector without sort
 
     stats_vec_t::size_type i;
@@ -667,6 +676,7 @@ json_out_stats(intercept_state * api_state)
 
   APPEND(" \"global\": {\n");
   APPEND_STAT("response.count.2xx.get", "%" PRIu64, global_response_count_2xx_get);
+  APPEND_STAT("channel.count", "%zu", channel_stats.size());
 
   if (api_state->show_global)
     TSRecordDump(TS_RECORDTYPE_PROCESS, json_out_stat, api_state); // internal stats
